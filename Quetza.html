@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quetza | Oráculo Cloud</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+    <script src="quetza-banco.js"></script>
+
+    <style>
+        body { background-color: #0b111e; color: #e5e7eb; font-family: 'Inter', sans-serif; margin: 0; }
+        .neon-border { border: 1px solid #3b82f6; box-shadow: 0 0 15px rgba(59, 130, 246, 0.1); }
+        .locked-border { border: 1px solid #ef4444; box-shadow: 0 0 15px rgba(239, 68, 68, 0.15); }
+        .fade-in { animation: fadeIn 0.5s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+</head>
+<body class="flex flex-col items-center min-h-screen p-4 sm:p-8">
+
+    <header class="w-full max-w-5xl flex justify-between items-center mb-10 border-b border-gray-800 pb-6 mt-4">
+        <div class="flex items-center gap-4">
+            <img src="logo.png" alt="Quetza MX" class="w-40 object-contain drop-shadow-[0_0_12px_rgba(59,130,246,0.3)]">
+            
+            <div class="border-l border-gray-700 pl-4 ml-2">
+                <h1 class="text-2xl font-black text-white tracking-tighter">QUETZA <span class="text-blue-500">PULSE</span></h1>
+                <p class="text-[10px] uppercase tracking-[0.2em] text-gray-500 font-bold">Terminal Sincronizada (Nube)</p>
+            </div>
+        </div>
+        
+        <div id="banco-status">
+            <p class="text-xs text-blue-500 animate-pulse">Conectando a la red global...</p>
+        </div>
+    </header>
+
+    <main class="w-full max-w-5xl fade-in" id="markets-container">
+        <div class="flex flex-col items-center justify-center py-20">
+            <div class="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+            <p class="text-gray-500 font-mono text-sm">Buscando contratos en la nube...</p>
+        </div>
+    </main>
+
+    <script>
+        // ==========================================
+        // 1. CONEXIÓN A SUPABASE (NIVEL PÚBLICO)
+        // ==========================================
+        const ORACLE_URL = 'https://bhgnilcpdksfniishdzo.supabase.co';
+        const ORACLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJoZ25pbGNwZGtzZm5paXNoZHpvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODYxMTczMywiZXhwIjoyMDk0MTg3NzMzfQ.E1pOAw9J-9tJwmFyusk-mFgNV0eK7uxBmwfarE_Gw9s'; 
+
+        const dbCloud = window.supabase.createClient(ORACLE_URL, ORACLE_KEY);
+
+        let usuarioLogueado = null;
+        let saldoDisponible = 0;
+        const selecciones = {};
+        let cronometroGlobal = null;
+
+       // ==========================================
+        // 2. ARRANQUE DEL SISTEMA
+        // ==========================================
+        window.onload = () => {
+            // Inicializar el Banco (login del usuario)
+            inicializarBancoEnPagina((user, saldo) => {
+                usuarioLogueado = user;
+                saldoDisponible = saldo;
+                
+                // 🟢 Actualizamos el letrero para avisar que el banco respondió
+                document.getElementById('banco-status').innerHTML = '<p class="text-xs text-green-500 font-bold tracking-widest">🟢 EN LÍNEA</p>';
+                
+                // Una vez logueado, leemos los mercados de la base de datos
+                cargarMercadosDesdeNube();
+                
+                // Nos suscribimos para escuchar en tiempo real si el Admin lanza otro
+                suscribirseRealtime();
+            });
+        }
+
+        // ==========================================
+        // 3. LEER LA NUBE Y ESCUCHAR CAMBIOS
+        // ==========================================
+        async function cargarMercadosDesdeNube() {
+            const { data, error } = await dbCloud
+                .from('quetza_markets')
+                .select('*')
+                .eq('status', 'open') // Solo traemos los que están abiertos
+                .order('created_at', { ascending: false });
+
+            if (error) {
+                console.error("Error leyendo mercados:", error);
+                return;
+            }
+
+            renderizarMercados(data);
+        }
+
+        function suscribirseRealtime() {
+            dbCloud.channel('mercados-publicos')
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'quetza_markets' }, payload => {
+                    console.log("¡El Búnker ha actualizado los mercados!");
+                    cargarMercadosDesdeNube(); // Recargamos si hay cambios
+                })
+                .subscribe();
+        }
+
+        // ==========================================
+        // 4. DIBUJAR LOS MERCADOS EN PANTALLA
+        // ==========================================
+        function renderizarMercados(markets) {
+            const container = document.getElementById('markets-container');
+            
+            if (!markets || markets.length === 0) {
+                container.innerHTML = `
+                    <div class="text-center py-20 bg-gray-900/50 rounded-3xl border border-dashed border-gray-800">
+                        <p class="text-gray-500">No hay contratos activos en la nube en este momento.</p>
+                        <p class="text-xs text-gray-700 mt-2">Esperando señal del Búnker Admin...</p>
+                    </div>`;
+                if(cronometroGlobal) clearInterval(cronometroGlobal);
+                return;
+            }
+
+            let html = '<h2 class="text-xs font-bold text-blue-500 uppercase tracking-[0.3em] mb-8 ml-2">Mercados Globales en Tiempo Real</h2>';
+
+            markets.forEach(m => {
+                const chartDiv = m.symbol ? `<div class="w-full h-64 bg-black/40 rounded-xl mb-6 overflow-hidden border border-gray-800" id="tv_chart_${m.id}"></div>` : '';
+
+                html += `
+                <div id="card-${m.id}" class="bg-[#0f172a] rounded-2xl p-6 neon-border mb-8 transition-all duration-500" data-ends="${m.ends_at}">
+                    <div class="flex justify-between items-start mb-6">
+                        <div>
+                            <span class="text-[10px] bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-1 rounded font-bold uppercase">${m.asset || 'Activo'}</span>
+                            <h3 class="text-xl font-bold text-white mt-3">${m.question}</h3>
+                        </div>
+                        <div id="timer-badge-${m.id}" class="text-right">
+                            <p class="text-[10px] text-gray-500 font-mono uppercase">Tiempo Restante</p>
+                            <p class="text-blue-400 font-mono font-bold time-display">Calculando...</p>
+                        </div>
+                    </div>
+
+                    ${chartDiv}
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div class="bg-gray-900/50 p-4 rounded-xl border border-gray-800 flex flex-col justify-center">
+                            <div class="flex gap-2" id="botones-votacion-${m.id}">
+                                <button onclick="seleccionarOpcion('${m.id}', 'SI')" class="flex-1 bg-green-500/10 hover:bg-green-500/20 border border-green-500/30 text-green-500 py-3 rounded-lg font-bold transition-all active:scale-95">SUBE</button>
+                                <button onclick="seleccionarOpcion('${m.id}', 'NO')" class="flex-1 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-500 py-3 rounded-lg font-bold transition-all active:scale-95">BAJA</button>
+                            </div>
+                        </div>
+
+                        <div id="panel-ejecucion-${m.id}" class="bg-blue-500/5 p-4 rounded-xl border border-blue-500/10 flex flex-col justify-center">
+                            <div class="flex justify-between items-center mb-3">
+                                <span class="text-[10px] text-gray-400 font-bold uppercase">Monto a Invertir</span>
+                                <span id="txt-opcion-${m.id}" class="text-[10px] text-gray-600 font-black">ESPERANDO DIRECCIÓN</span>
+                            </div>
+                            <div class="flex gap-2">
+                                <input id="input-monto-${m.id}" type="number" placeholder="0.00" class="flex-1 bg-gray-900 border border-gray-700 rounded-lg p-3 text-white outline-none focus:border-blue-500 transition-colors">
+                                <button onclick="registrarPrediccion(event, '${m.id}')" class="bg-blue-600 hover:bg-blue-500 text-white px-6 rounded-lg font-bold text-sm shadow-lg shadow-blue-600/20 transition-all active:scale-95">
+                                    FIRMAR
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+            });
+
+            container.innerHTML = html;
+
+            // Cargar gráficos de TradingView
+            markets.forEach(m => {
+                if(m.symbol) {
+                    new TradingView.widget({
+                        "autosize": true, "symbol": m.symbol, "interval": "1", "timezone": "Etc/UTC", "theme": "dark", "style": "2",
+                        "hide_top_toolbar": true, "container_id": `tv_chart_${m.id}`
+                    });
+                }
+            });
+
+            // Iniciar relojes sincronizados con la nube
+            if(cronometroGlobal) clearInterval(cronometroGlobal);
+            cronometroGlobal = setInterval(actualizarCronometros, 1000);
+        }
+
+        // ==========================================
+        // 5. REGISTRAR PREDICCIÓN EN LA NUBE
+        // ==========================================
+        function seleccionarOpcion(id, opcion) {
+            selecciones[id] = opcion;
+            const txt = document.getElementById(`txt-opcion-${id}`);
+            txt.innerText = opcion === 'SI' ? "PREDICCIÓN: SUBE ▲" : "PREDICCIÓN: BAJA ▼";
+            txt.className = opcion === 'SI' ? "text-green-400 font-black" : "text-red-400 font-black";
+        }
+
+        async function registrarPrediccion(e, id) {
+            e.preventDefault();
+            const opcion = selecciones[id];
+            const montoInput = document.getElementById(`input-monto-${id}`);
+            const monto = parseFloat(montoInput.value);
+
+            if (!usuarioLogueado) return alert("Debes iniciar sesión primero.");
+            if (!opcion) return alert("Por favor selecciona una dirección (SUBE o BAJA)");
+            if (isNaN(monto) || monto <= 0) return alert("Ingresa un monto válido");
+            if (monto > saldoDisponible) return alert("Saldo insuficiente en tu billetera.");
+
+            const btn = e.target;
+            btn.innerText = "PROCESANDO...";
+            btn.disabled = true;
+
+            // PASO A: Cobramos en el banco global
+            const cobro = await modificarSaldoUsuario(usuarioLogueado.id, monto, 'apuesta_oraculo', false);
+            
+            if (cobro.exito) {
+                // PASO B: Inyectamos el contrato firmado a la tabla de predicciones
+                const { error } = await dbCloud
+                    .from('quetza_predictions')
+                    .insert([{ 
+                        market_id: id, 
+                        user_id: usuarioLogueado.id, 
+                        option: opcion, 
+                        amount: monto 
+                    }]);
+
+                if (error) {
+                    alert("Falla al guardar contrato, contacte soporte.");
+                    console.error(error);
+                } else {
+                    saldoDisponible -= monto;
+                    if(document.getElementById('nav-saldo-quetza')) {
+                        document.getElementById('nav-saldo-quetza').innerText = saldoDisponible + " QTZ";
+                    }
+                    montoInput.value = "";
+                    alert(`¡Contrato encriptado en la nube! Invertiste ${monto} QTZ.`);
+                }
+            } else {
+                alert("Error en la bóveda: " + cobro.mensaje);
+            }
+            
+            btn.innerText = "FIRMAR";
+            btn.disabled = false;
+        }
+
+        // ==========================================
+        // 6. RELOJES SINCRONIZADOS
+        // ==========================================
+        function actualizarCronometros() {
+            const cards = document.querySelectorAll('[data-ends]');
+            const ahora = Date.now();
+
+            cards.forEach(card => {
+                const endsAtStr = card.getAttribute('data-ends');
+                if(!endsAtStr) return;
+                
+                const fechaCierre = new Date(endsAtStr).getTime();
+                const restanteMs = fechaCierre - ahora;
+                const display = card.querySelector('.time-display');
+
+                if (restanteMs > 0) {
+                    const min = Math.floor(restanteMs / 60000);
+                    const sec = Math.floor((restanteMs % 60000) / 1000);
+                    display.innerText = `${min}:${sec.toString().padStart(2, '0')}`;
+                } else {
+                    display.innerText = "CERRADO";
+                    display.className = "text-red-500 font-mono font-bold time-display";
+                    card.classList.replace('neon-border', 'locked-border');
+                    const panel = card.querySelector('[id^="panel-ejecucion-"]');
+                    if(panel) panel.style.opacity = "0.2";
+                }
+            });
+        }
+    </script>
+</body>
+</html>
